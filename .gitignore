@@ -1,0 +1,53 @@
+# build output
+dist/
+build/
+*.egg-info/
+
+# CLI提示文档
+AGENTS.md
+CLAUDE.md
+
+# Node前端依赖
+node_modules/
+
+# 包管理器日志
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# 环境变量文件
+.env
+.env.production
+
+# macOS系统文件
+.DS_Store
+
+# JetBrains编辑器配置
+.idea/
+
+# VS Code 本地配置
+.vscode/
+*.code-workspace
+
+# Python缓存 & 虚拟环境
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+venv/
+.venv/
+env/
+
+# 临时文件、缓存、日志
+*.log
+*.tmp
+*.bak
+.cache/
+
+# Windows系统文件
+Thumbs.db
+
+# vim临时文件
+*.swp
+*.swo
