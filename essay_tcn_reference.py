@@ -72,12 +72,58 @@ def download_and_extract(url, cache_dir=DATA_CACHE_DIR):
 
 def ask_yes_no(question, default=True):
     """交互式 Y/N 提问，空输入使用默认值。"""
-    pass
+    suffix = " [Y/n] " if default else " [y/N] "
+    while True:
+        answer = input(question + suffix).strip().lower()
+        if not answer:
+            return default
+        if answer in ("y", "yes"):
+            return True
+        if answer in ("n", "no"):
+            return False
+        print("请输入 y 或 n。")
+
+
+def ask_gate_style(default="full"):
+    """交互式选择 CCMA 门控样式；compare 表示三种都跑并报告最优。"""
+    prompt = (
+        "\n选择 CCMA 融合门控样式:\n"
+        "  score   - 3参数关联分数门控（最稳）\n"
+        "  mlp     - 2维小MLP门控（折中）\n"
+        "  full    - 385维完整MLP门控（台湾实测更优，默认）\n"
+        "  compare - 三种都跑，最后报告最优\n"
+        f"请输入 score/mlp/full/compare [{default}]: "
+    )
+    while True:
+        answer = input(prompt).strip().lower()
+        if not answer:
+            return default
+        if answer in ("score", "mlp", "full", "compare"):
+            return answer
+        print("请输入 score、mlp、full 或 compare。")
 
 
 def interactive_experiment_setup(default_dataset=None):
-    """启动交互：选择数据集与实验开关（含 CCMA 秩敏感性），返回参数字典。"""
-    pass
+    """启动交互：选择数据集、实验开关、CCMA门控样式，返回参数字典。"""
+    if default_dataset is None:
+        default_dataset = input("选择数据集 (taiwan/home/both) [taiwan]: ").strip().lower() or "taiwan"
+    if default_dataset not in ("taiwan", "home", "both"):
+        raise ValueError("dataset 必须是 taiwan、home 或 both。")
+
+    return {
+        "dataset_name": default_dataset,
+        "run_baselines": ask_yes_no("是否运行基线对比 (ML+DL)？", default=True),
+        "run_ablation": ask_yes_no("是否运行消融实验？", default=True),
+        "run_imbalance": ask_yes_no("是否运行类别不平衡鲁棒性？", default=True),
+        "run_cross_dataset": ask_yes_no("是否运行跨数据集泛化？", default=True),
+        "run_history_length": ask_yes_no("是否运行历史长度敏感性？", default=True),
+        "run_rank_sensitivity": ask_yes_no("是否运行 CCMA rank 敏感性？", default=True),
+        "run_shap": ask_yes_no("是否运行 SHAP 可解释性？", default=True),
+        "make_plots": ask_yes_no("是否生成 PNG 图表？", default=True),
+        "save_results": ask_yes_no("是否保存结果？", default=True),
+        "gate_style": ask_gate_style(),
+        "gate_hidden": 8,
+    }
 
 
 def set_seed(seed, deterministic=True):
@@ -222,8 +268,15 @@ class CausalConv1d(nn.Module):
     """
     def __init__(self, in_channels, out_channels, kernel_size, dilation):
         super().__init__()
-        pass
-    def forward(self, x): pass
+        self.padding = (kernel_size - 1) * dilation
+        self.conv = weight_norm(nn.Conv1d(
+            in_channels, out_channels, kernel_size,
+            padding=self.padding, dilation=dilation))
+    def forward(self, x):
+        out = self.conv(x)
+        if self.padding > 0:
+            out = out[:, :, :-self.padding]
+        return out
 
 
 class TCNBlock(nn.Module):
@@ -239,10 +292,30 @@ class TCNBlock(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=3, dilation=1,
                  dropout=0.2, depth=0, num_layers=4, use_hdg=True):
         super().__init__()
-        pass
+        self.dilation = dilation
+        self.depth = depth
+        self.use_hdg = use_hdg
+        self.conv1 = CausalConv1d(in_channels, out_channels, kernel_size, dilation)
+        self.conv2 = CausalConv1d(out_channels, out_channels, kernel_size, dilation)
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(dropout)
+        self.skip = nn.Identity() if in_channels == out_channels else nn.Conv1d(in_channels, out_channels, 1)
+        self.norm = nn.LayerNorm(out_channels)
+        if use_hdg:
+            self.hdg = HierarchicalDilatedGating(
+                out_channels, dilation=dilation, depth=depth, num_layers=num_layers)
     def forward(self, x):
         """返回 out[B,T,out_C], hdg_stats dict|None"""
-        pass
+        x_t = x.transpose(1, 2)                     # [B,C,T]
+        h = self.dropout(self.relu(self.conv1(x_t)))
+        h = self.dropout(self.relu(self.conv2(h)))  # [B,C,T] 残差块学到的信号
+        shortcut = self.skip(x_t)                   # [B,C,T] 恒等/投影旁路
+        if self.use_hdg:
+            gated, hdg_stats = self.hdg(
+                shortcut.transpose(1, 2), h.transpose(1, 2))
+            return self.norm(gated), hdg_stats
+        out = (h + shortcut).transpose(1, 2)
+        return self.norm(out), None
 
 
 class TCNEncoder(nn.Module):
@@ -258,10 +331,40 @@ class TCNEncoder(nn.Module):
          outputs,hdg_list=encoder(x)
     """
     def __init__(self, input_dim, hidden_dim, num_layers=4, kernel_size=3,
-                 base_dilation=1, dropout=0.2, use_hdg=True, mode='parallel'):
+                 base_dilation=1, dropout=0.2, use_hdg=True, mode='parallel',
+                 dilation_rates=None):
         super().__init__()
-        pass
-    def forward(self, x): pass
+        if dilation_rates is None:
+            dilation_rates = [base_dilation * (2 ** i) for i in range(num_layers)]
+        self.dilation_rates = list(dilation_rates)
+        self.mode = mode
+        if mode == 'parallel':
+            self.blocks = nn.ModuleList([
+                TCNBlock(input_dim, hidden_dim, kernel_size, d, dropout,
+                         depth=i, num_layers=len(self.dilation_rates), use_hdg=use_hdg)
+                for i, d in enumerate(self.dilation_rates)
+            ])
+        else:
+            self.blocks = nn.ModuleList([
+                TCNBlock(input_dim if i == 0 else hidden_dim, hidden_dim,
+                         kernel_size, d, dropout, depth=i,
+                         num_layers=len(self.dilation_rates), use_hdg=use_hdg)
+                for i, d in enumerate(self.dilation_rates)
+            ])
+    def forward(self, x):
+        hdg_list = []
+        if self.mode == 'parallel':
+            outputs = []
+            for block in self.blocks:
+                out, stats = block(x)
+                outputs.append(out)
+                hdg_list.append(stats)
+            return outputs, hdg_list
+        h = x
+        for block in self.blocks:
+            h, stats = block(h)
+            hdg_list.append(stats)
+        return h, hdg_list
 
 
 # ============================================================
@@ -275,28 +378,66 @@ class HierarchicalDilatedGating(nn.Module):
     层次膨胀门控(HDG) — TCN特有创新。
 
     核心: 堆叠越深不一定越好。每层根据三个结构信号动态决定残差贡献:
-      1. 膨胀率d     — 感受野大小
-      2. 层深depth   — 越深越易过拟合
-      3. 激活饱和度  — 输出太平=没学到东西
+      1. 膨胀率d     — 感受野大小（log2归一化）
+      2. 层深depth   — 越深越易过拟合（逐层递减偏置）
+      3. 激活饱和度  — 从残差块输出计算：太平=没学到东西
 
     防过拟合: 逐层递减偏置（深层默认保守，信号强才激活）
-      gate = sigmoid(MLP([d_norm, depth_norm, activation_sat]))
-      output = x + gate * residual
+      gate = sigmoid(MLP([d_norm, depth_norm, sat_mean, sat_var]))
+      output = x + gate * residual     # x=投影后的shortcut, residual=卷积块输出
 
     位置: TCNBlock残差连接之后、LayerNorm之前。
 
     调用: hdg=HierarchicalDilatedGating(128,dilation=4,depth=2,num_layers=4)
          gated,stats=hdg(x,residual)
     """
-    def __init__(self, hidden_dim, dilation, depth, num_layers=4, bottleneck=None):
+    def __init__(self, hidden_dim, dilation, depth, num_layers=4, bottleneck=None,
+                 gate_dropout=0.1):
         super().__init__()
-        pass
+        self.hidden_dim = hidden_dim
+        self.dilation = dilation
+        self.depth = depth
+        self.num_layers = num_layers
+        d_norm = float(np.log2(max(dilation, 1))) / max(num_layers - 1, 1)
+        depth_norm = float(depth) / max(num_layers - 1, 1)
+        self.register_buffer('d_norm', torch.tensor(d_norm))
+        self.register_buffer('depth_norm', torch.tensor(depth_norm))
+        self.gate_net = nn.Sequential(
+            nn.Linear(4, bottleneck or 16),
+            nn.GELU(),
+            nn.Dropout(gate_dropout),
+            nn.Linear(bottleneck or 16, 1),
+        )
+        with torch.no_grad():
+            # 深层默认更保守：偏置随depth线性变负
+            self.gate_net[-1].bias.fill_(-0.5 - 1.0 * depth_norm)
     def _compute_activation_saturation(self, x):
-        """返回逐通道 mean[B,D], var[B,D]"""
-        pass
+        """返回逐token mean[B,T], var[B,T]"""
+        mean = x.mean(dim=-1)
+        var = x.var(dim=-1, unbiased=False)
+        return mean, var
     def forward(self, x, residual):
         """返回 gated_output[B,T,D], gate_stats dict"""
-        pass
+        sat_mean, sat_var = self._compute_activation_saturation(residual)
+        gate_in = torch.stack([
+            self.d_norm.expand_as(sat_mean),
+            self.depth_norm.expand_as(sat_mean),
+            torch.tanh(sat_mean),
+            torch.tanh(sat_var / (float(self.hidden_dim) ** 0.5)),
+        ], dim=-1)
+        gate = torch.sigmoid(self.gate_net(gate_in))      # [B,T,1]
+        out = x + gate * residual
+        gate_stats = {
+            'gate_mean': float(gate.mean().item()),
+            'gate_std': float(gate.std().item()),
+            'gate_min': float(gate.min().item()),
+            'gate_max': float(gate.max().item()),
+            'sat_mean': float(sat_mean.mean().item()),
+            'sat_var': float(sat_var.mean().item()),
+            'd_norm': float(self.d_norm.item()),
+            'depth_norm': float(self.depth_norm.item()),
+        }
+        return out, gate_stats
 
 
 # ----- 创新二：交叉拼接多头注意力 (CCMA) -----
@@ -309,48 +450,193 @@ class LowRankCrossFusion(nn.Module):
 
     U:[static_dim,rank=4]  V:[temporal_dim,rank=4]
 
-    三条通路+门控融合:
+    三条通路+门控融合（交叉项只做增量，独立通路永远保留）:
       cross   = (static@U) * (temporal@V) -> Linear -> [B,T,D]
       s_path  = Linear(static).expand     -> [B,T,D]
       t_path  = Linear(temporal)          -> [B,T,D]
-      gate    = sigmoid(MLP([cross,s_path,t_path]))
-      fused   = t_path + gate*cross + (1-gate)*s_path
+      cos     = cosine_similarity(static_lr, temporal_lr)      # [-1,1] 方向一致性
+      mag     = sum(static_lr * temporal_lr)                   # 共同变化幅度
+      fused   = t_path + s_path + gate*cross
 
-    防过拟合三层: 低秩瓶颈 + 旁路保留 + 门控自适应
+    门控三档（gate_style，训练时对比选最优）:
+      score   gate=sigmoid(w_cos*cos + w_mag*mag + bias)       # 3参数，最稳
+      mlp     gate=sigmoid(MLP([cos,mag]))                     # 2维小MLP，推荐折中
+      full    gate=sigmoid(MLP([cross,s_path,t_path,cos]))     # 最表达力，最易过拟合
+
+    关联强时gate→1，交叉项生效；关联弱时gate→0，静态/时序两条通路各自独立。
+    防过拟合: 低秩瓶颈 + 永久独立旁路 + 门控瓶颈（gate_bottleneck）+ dropout
+              + 可选融合预算正则（fusion_lambda，由Trainer调用fusion_budget_loss）。
+    训练后检查gate分布是否退化（全0/全1=没有学到选择性），并配合固定gate消融。
     训练后|U*V^T|可直接可视化→论文图表素材
 
-    调用: fusion=LowRankCrossFusion(30,5,128,rank=4)
+    调用: fusion=LowRankCrossFusion(30,5,128,rank=4,gate_style='mlp')
          fused=fusion(static_feat,temporal_feat)
     """
-    def __init__(self, static_dim, temporal_dim, hidden_dim, rank=4, dropout=0.1):
+    def __init__(self, static_dim, temporal_dim, hidden_dim, rank=4, dropout=0.1,
+                 gate_style='mlp', gate_hidden=8, gate_dropout=0.1,
+                 use_feature_relevance=True):
         super().__init__()
-        pass
-    def forward(self, static_feat, temporal_feat):
-        """static[B,S] temporal[B,T,F] -> fused[B,T,hidden_dim]"""
-        pass
+        self.rank = rank
+        self.use_feature_relevance = use_feature_relevance
+        self.U = nn.Parameter(torch.empty(static_dim, rank))
+        self.V = nn.Parameter(torch.empty(temporal_dim, rank))
+        self.cross_bias = nn.Parameter(torch.zeros(rank))
+        nn.init.kaiming_uniform_(self.U)
+        nn.init.kaiming_uniform_(self.V)
+        if use_feature_relevance:
+            # 特征级选择：初始接近全开，模型学习把无对应关系的静态特征关掉
+            self.feature_relevance = nn.Parameter(torch.full((static_dim,), 2.2))
+
+        self.static_proj = nn.Linear(static_dim, hidden_dim)
+        self.temporal_proj = nn.Linear(temporal_dim, hidden_dim)
+        self.cross_proj = nn.Linear(rank, hidden_dim)
+
+        self.gate_style = gate_style
+        if gate_style == 'score':
+            self.w_cos = nn.Parameter(torch.tensor(1.0))
+            self.w_mag = nn.Parameter(torch.tensor(0.1))
+            self.gate_bias = nn.Parameter(torch.tensor(-0.5))
+        elif gate_style == 'mlp':
+            self.gate_net = nn.Sequential(
+                nn.Linear(2, gate_hidden),
+                nn.GELU(),
+                nn.Dropout(gate_dropout),
+                nn.Linear(gate_hidden, 1),
+            )
+        elif gate_style == 'full':
+            gate_in_dim = 3 * hidden_dim + 1  # cross + s_path + t_path + cos
+            self.gate_norm = nn.LayerNorm(gate_in_dim)
+            self.gate_net = nn.Sequential(
+                nn.Linear(gate_in_dim, gate_hidden),
+                nn.GELU(),
+                nn.Dropout(gate_dropout),
+                nn.Linear(gate_hidden, 1),
+            )
+        else:
+            raise ValueError("gate_style must be one of ['score', 'mlp', 'full']")
+        self.gate_dropout = nn.Dropout(dropout)
+        self.last_gate = None
+
+    def forward(self, static_feat, temporal_feat, return_stats=False):
+        """static[B,S] temporal[B,T,F] -> fused[B,T,hidden_dim]；return_stats=True时返回(fused,stats)"""
+        B, T, _ = temporal_feat.shape
+
+        if self.use_feature_relevance:
+            s_weighted = static_feat * torch.sigmoid(self.feature_relevance).unsqueeze(0)
+        else:
+            s_weighted = static_feat
+        static_lr = s_weighted @ self.U                        # [B,rank]
+        temporal_lr = temporal_feat @ self.V                   # [B,T,rank]
+        cross_lr = static_lr.unsqueeze(1) * temporal_lr + self.cross_bias  # [B,T,rank]
+        cross = self.cross_proj(cross_lr)                      # [B,T,D]
+
+        s_path = self.static_proj(static_feat).unsqueeze(1).expand(B, T, -1)  # [B,T,D]
+        t_path = self.temporal_proj(temporal_feat)             # [B,T,D]
+
+        cos = F.cosine_similarity(
+            static_lr.unsqueeze(1).expand(B, T, self.rank),
+            temporal_lr, dim=-1
+        )                                                        # [B,T]
+        mag = cross_lr.sum(dim=-1)                               # [B,T]
+
+        if self.gate_style == 'score':
+            score = self.w_cos * cos + self.w_mag * mag + self.gate_bias
+            gate = torch.sigmoid(score).unsqueeze(-1)            # [B,T,1]
+        elif self.gate_style == 'mlp':
+            gate_in = torch.stack([cos, mag], dim=-1)            # [B,T,2]
+            gate = torch.sigmoid(self.gate_net(gate_in))         # [B,T,1]
+        else:  # full
+            gate_in = torch.cat([cross, s_path, t_path, cos.unsqueeze(-1)], dim=-1)
+            gate = torch.sigmoid(self.gate_net(self.gate_norm(gate_in)))  # [B,T,1]
+        self.last_gate = gate
+
+        fused = t_path + s_path + self.gate_dropout(gate) * cross
+        if return_stats:
+            stats = {
+                'gate_mean': float(gate.mean().item()),
+                'gate_std': float(gate.std().item()),
+                'gate_min': float(gate.min().item()),
+                'gate_max': float(gate.max().item()),
+                'assoc_mean': float(cos.mean().item()),
+                'cross_mag': float(cross.abs().mean().item()),
+                'relevance_mean': float(torch.sigmoid(self.feature_relevance).mean().item())
+                if self.use_feature_relevance else float('nan'),
+            }
+            return fused, stats
+        return fused
+
+    def fusion_budget_loss(self):
+        """融合预算正则: 默认少融合，信号强才放开。由Trainer乘fusion_lambda后加入总loss。"""
+        if self.last_gate is None:
+            return torch.zeros((), device=self.U.device)
+        return self.last_gate.mean()
 
 
 class CrossConcatMultiHeadAttention(nn.Module):
     """
     交叉拼接多头注意力(CCMA第二阶段)。
 
-    核心: 经低秩交叉后，静态信息已注入每个时间步。让含静态信息的
-    时序token互相交互——捕获时间步间依赖。
+    核心: 真交叉注意力。Q来自时序投影，K/V来自低秩融合后的token，
+    让“纯时序查询”从“含静态信息的融合表示”中提取交互证据。
 
-    内部=标准TransformerBlock:
-      MultiHeadAttention(Q=K=V=fused,8heads)->残差+LN->FFN->残差+LN
+    内部=交叉TransformerBlock:
+      MultiHeadAttention(Q=temporal, K=V=fused, 8heads) -> 残差+LN -> FFN -> 残差+LN
+      附带可学习位置编码（短序列上也能区分时间步）。
 
-    attn_weights[B,T,T]双重用途: 可解释+传给DAFL
+    attn_weights[B,T,T]仅用于可解释性；DAFL使用TCN分支注意力branch_attention[B,K]，
+    两者不再混用。
 
     调用: ccma=CrossConcatMultiHeadAttention(128,num_heads=8)
-         attended,attn_weights,stats=ccma(fused)
+         attended,attn_weights,stats=ccma(temporal_proj,fused)
     """
-    def __init__(self, hidden_dim, num_heads=8, dropout=0.1):
+    def __init__(self, hidden_dim, num_heads=8, dropout=0.1, max_len=64):
         super().__init__()
-        pass
-    def forward(self, fused_feat):
-        """返回 attended[B,T,D], attn_weights[B,T,T], attn_stats dict"""
-        pass
+        assert hidden_dim % num_heads == 0, "hidden_dim必须能被num_heads整除"
+        self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
+        self.q_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.k_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.v_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.out_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.norm2 = nn.LayerNorm(hidden_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_dim, 4 * hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(4 * hidden_dim, hidden_dim),
+            nn.Dropout(dropout),
+        )
+        self.attn_dropout = nn.Dropout(dropout)
+        self.position = nn.Parameter(torch.zeros(1, max_len, hidden_dim))
+        nn.init.normal_(self.position, std=0.02)
+
+    def forward(self, query_feat, fused_feat):
+        """query_feat[B,T,D]为时序投影；fused_feat[B,T,D]为低秩融合结果。
+        返回 attended[B,T,D], attn_weights[B,T,T], attn_stats dict"""
+        B, T, D = query_feat.shape
+        q = query_feat + self.position[:, :T]                  # [B,T,D]
+        q = self.q_proj(q).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(fused_feat).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(fused_feat).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+
+        scores = q @ k.transpose(-2, -1) / (float(self.head_dim) ** 0.5)
+        attn = torch.softmax(scores, dim=-1)
+        attn = self.attn_dropout(attn)
+        ctx = (attn @ v).transpose(1, 2).reshape(B, T, D)
+        attended = self.norm1(query_feat + self.out_proj(ctx))
+        attended = self.norm2(attended + self.ffn(attended))
+
+        attn_weights = attn.mean(dim=1)                        # [B,T,T]
+        eps = 1e-7
+        attn_entropy = -(attn_weights * (attn_weights + eps).log()).sum(dim=-1)
+        attn_stats = {
+            'attn_mean': float(attn_weights.mean().item()),
+            'attn_std': float(attn_weights.std().item()),
+            'attn_entropy': float(attn_entropy.mean().item()),
+        }
+        return attended, attn_weights, attn_stats
 
 
 # ----- 创新三：膨胀感知动态损失 (DAFL) -----
@@ -359,40 +645,86 @@ class DilationAwareFocalLoss(nn.Module):
     """
     膨胀感知动态损失(DAFL) — TCN特有创新。
 
-    核心: 不让模型只盯一个感受野。加入膨胀熵正则——
-    若分支注意力过于集中（熵低），施加惩罚。
+    核心: 不让模型只盯一个感受野。熵正则改为hinge形式——
+    只在分支注意力低于目标熵时才惩罚过度集中，不强制模型均匀使用所有分支。
 
-    loss = focal_loss + lambda*(1 - entropy/max_entropy)
+    loss = focal_loss + lambda*max(0, target_entropy - entropy)
 
     参数:
-      alpha_pos: 违约类基础权重(默认0.75)
-      alpha_neg: 正常类基础权重(默认0.25)
-      gamma_base: 最小gamma(默认1.0)
-      gamma_max: 最大gamma(默认3.0)
-      num_epochs: 总训练轮数(用于gamma调度)
+      alpha_pos/alpha_neg: 类别权重，建议按违约率设置，可用for_default_rate生成
+      gamma_base/gamma_max: gamma调度范围（warmup后才开始上升）
+      num_epochs: 总训练轮数
       num_branches: 膨胀分支数(用于max_entropy计算)
-      entropy_lambda: 熵正则强度(默认0.1)
+      entropy_lambda: 熵正则强度
+      entropy_target: 目标熵比例(默认0.8*max_entropy)
+      gamma_warmup: gamma保持gamma_base的轮数
       epsilon: 数值稳定性常数
 
     branch_attention=None -> 退化为标准DynamicFocalLoss
 
-    调用: criterion=DilationAwareFocalLoss(num_epochs=150,num_branches=4,entropy_lambda=0.1)
+    调用:
+      criterion=DilationAwareFocalLoss.for_default_rate(0.22, num_epochs=150)
          criterion.set_epoch(epoch)
          loss,stats=criterion(logits,targets,branch_attention)
     """
     def __init__(self, alpha_pos=0.75, alpha_neg=0.25, gamma_base=1.0, gamma_max=3.0,
-                 num_epochs=100, num_branches=4, entropy_lambda=0.1, epsilon=1e-7):
+                 num_epochs=100, num_branches=4, entropy_lambda=0.1,
+                 entropy_target=0.8, gamma_warmup=10, epsilon=1e-7):
         super().__init__()
-        pass
+        self.alpha_pos = alpha_pos
+        self.alpha_neg = alpha_neg
+        self.gamma_base = gamma_base
+        self.gamma_max = gamma_max
+        self.num_epochs = num_epochs
+        self.num_branches = num_branches
+        self.entropy_lambda = entropy_lambda
+        self.entropy_target = entropy_target
+        self.gamma_warmup = gamma_warmup
+        self.epsilon = epsilon
+        self.current_epoch = 0
+
+    @classmethod
+    def for_default_rate(cls, default_rate, **kwargs):
+        """按数据集违约率生成类别权重，避免Taiwan/Home共用一套alpha。"""
+        return cls(alpha_pos=1.0 - default_rate, alpha_neg=default_rate, **kwargs)
+
     def set_epoch(self, epoch):
         """每个epoch开始前调用，更新self.current_epoch用于gamma调度。"""
-        pass
+        self.current_epoch = epoch
+
+    def _gamma(self):
+        progress = min(max(
+            (self.current_epoch - self.gamma_warmup) /
+            max(self.num_epochs - self.gamma_warmup, 1), 0.0), 1.0)
+        return self.gamma_base + (self.gamma_max - self.gamma_base) * progress
+
     def _branch_entropy(self, branch_attention):
         """返回 entropy[N], max_entropy, entropy_gap[N]"""
-        pass
+        p = branch_attention.clamp(min=self.epsilon)
+        entropy = -(p * p.log()).sum(dim=-1)
+        max_entropy = float(np.log(max(self.num_branches, 1)))
+        return entropy, max_entropy, max_entropy - entropy
+
     def forward(self, logits, targets, branch_attention=None):
         """返回 total_loss(scalar), loss_stats(dict)"""
-        pass
+        gamma = self._gamma()
+        prob = torch.sigmoid(logits)
+        alpha = torch.where(targets == 1,
+                            torch.tensor(self.alpha_pos, device=logits.device),
+                            torch.tensor(self.alpha_neg, device=logits.device))
+        pt = torch.where(targets == 1, prob, 1.0 - prob)
+        focal = -alpha * (1.0 - pt) ** gamma * torch.log(pt + self.epsilon)
+        loss = focal.mean()
+        loss_stats = {'focal': float(loss.item()), 'gamma': float(gamma)}
+
+        if branch_attention is not None and self.entropy_lambda > 0:
+            entropy, max_entropy, _ = self._branch_entropy(branch_attention)
+            target = self.entropy_target * max_entropy
+            reg = torch.relu(target - entropy).mean()
+            loss = loss + self.entropy_lambda * reg
+            loss_stats['entropy_mean'] = float(entropy.mean().item())
+            loss_stats['entropy_reg'] = float(reg.item())
+        return loss, loss_stats
 
 
 # ----- 完整模型：GAD-TCN -----
@@ -422,9 +754,55 @@ class GADTCN(nn.Module):
     def __init__(self, static_dim, temporal_dim, temporal_steps, hidden_dim=128,
                  num_tcn_layers=4, kernel_size=3, dilation_rates=None,
                  num_heads=8, lowrank_rank=4, dropout=0.2,
-                 use_hdg=True, use_ccma=True, tcn_mode='parallel'):
+                 use_hdg=True, use_ccma=True, use_fusion=True, use_attention=True,
+                 tcn_mode='parallel',
+                 gate_style='mlp', gate_hidden=8):
         super().__init__()
-        self.model_config = {}  # 存储所有超参数，用于保存/恢复(checkpoint/bundle)
+        if dilation_rates is None:
+            dilation_rates = (1, 2, 4) if temporal_steps <= 6 else (1, 2, 4, 8)
+        dilation_rates = list(dilation_rates)
+        use_fusion = use_ccma and use_fusion
+        use_attention = use_ccma and use_attention
+        self.model_config = {
+            'static_dim': static_dim,
+            'temporal_dim': temporal_dim,
+            'temporal_steps': temporal_steps,
+            'hidden_dim': hidden_dim,
+            'num_tcn_layers': num_tcn_layers,
+            'kernel_size': kernel_size,
+            'dilation_rates': dilation_rates,
+            'num_heads': num_heads,
+            'lowrank_rank': lowrank_rank,
+            'dropout': dropout,
+            'use_hdg': use_hdg,
+            'use_ccma': use_ccma,
+            'use_fusion': use_fusion,
+            'use_attention': use_attention,
+            'tcn_mode': tcn_mode,
+            'gate_style': gate_style,
+            'gate_hidden': gate_hidden,
+        }
+        self.dilation_rates = dilation_rates
+        self.gate_style = gate_style
+        self.gate_hidden = gate_hidden
+        if use_fusion:
+            style = gate_style if gate_style != 'compare' else 'mlp'
+            self.cross_fusion = LowRankCrossFusion(
+                static_dim=static_dim,
+                temporal_dim=temporal_dim,
+                hidden_dim=hidden_dim,
+                rank=lowrank_rank,
+                dropout=dropout,
+                gate_style=style,
+                gate_hidden=gate_hidden,
+            )
+        else:
+            self.cross_fusion = None
+        if use_attention:
+            self.attention = CrossConcatMultiHeadAttention(
+                hidden_dim, num_heads=num_heads, dropout=dropout)
+        else:
+            self.attention = None
     def _compute_branch_attention(self, branch_outputs):
         """各分支时间池化->评分->softmax->[B,num_branches]"""
         pass
@@ -778,6 +1156,7 @@ def build_html_dashboard(model, test_metrics, history, attn_weights, branch_attn
 
 def run_experiment(dataset_name='taiwan', epochs=None, batch_size=None,
                    threshold_min_sensitivity=0.40,
+                   gate_style='mlp', gate_hidden=8,
                    run_baselines=True, run_ablation=True,
                    run_imbalance=True, run_cross_dataset=True,
                    run_history_length=True, run_rank_sensitivity=True,
@@ -789,7 +1168,7 @@ def run_experiment(dataset_name='taiwan', epochs=None, batch_size=None,
     1.URL加载数据(Taiwan/Home/Both) -> 数据形状打印+违约率统计
     2.预处理(四层分割+标准化+one-hot)
     3.DataLoader(pin_memory,num_workers)
-    4.初始化GADTCN(全模块: HDG+CCMA+parallel)
+    4.初始化GADTCN(全模块: HDG+CCMA+parallel, gate_style=用户选择)
     5.训练(DAFL+EMA+Platt校准)
     6.测试集七指标评估
     7.按开关选择性执行:
@@ -807,6 +1186,8 @@ def run_experiment(dataset_name='taiwan', epochs=None, batch_size=None,
         epochs:         训练轮数(None=使用默认值)
         batch_size:     批次大小(None=使用默认值)
         threshold_min_sensitivity: 阈值搜索最低敏感性
+        gate_style:     CCMA门控样式 score/mlp/full/compare
+        gate_hidden:    CCMA门控MLP隐藏维
         run_baselines: 运行基线对比
         run_ablation: 运行消融实验
         run_imbalance: 运行不平衡鲁棒性
@@ -847,6 +1228,8 @@ if __name__ == '__main__':
         dataset_name=options['dataset_name'],
         epochs=args.epochs,
         batch_size=args.batch_size,
+        gate_style=options['gate_style'],
+        gate_hidden=options['gate_hidden'],
         run_baselines=options['run_baselines'],
         run_ablation=options['run_ablation'],
         run_imbalance=options['run_imbalance'],
