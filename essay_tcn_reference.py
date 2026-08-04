@@ -469,11 +469,11 @@ class LowRankCrossFusion(nn.Module):
     训练后检查gate分布是否退化（全0/全1=没有学到选择性），并配合固定gate消融。
     训练后|U*V^T|可直接可视化→论文图表素材
 
-    调用: fusion=LowRankCrossFusion(30,5,128,rank=4,gate_style='mlp')
+    调用: fusion=LowRankCrossFusion(30,5,128,rank=4,gate_style='full')
          fused=fusion(static_feat,temporal_feat)
     """
     def __init__(self, static_dim, temporal_dim, hidden_dim, rank=4, dropout=0.1,
-                 gate_style='mlp', gate_hidden=8, gate_dropout=0.1,
+                 gate_style='full', gate_hidden=8, gate_dropout=0.1,
                  use_feature_relevance=True):
         super().__init__()
         self.rank = rank
@@ -756,7 +756,7 @@ class GADTCN(nn.Module):
                  num_heads=8, lowrank_rank=4, dropout=0.2,
                  use_hdg=True, use_ccma=True, use_fusion=True, use_attention=True,
                  tcn_mode='parallel',
-                 gate_style='mlp', gate_hidden=8):
+                 gate_style='full', gate_hidden=8):
         super().__init__()
         if dilation_rates is None:
             dilation_rates = (1, 2, 4) if temporal_steps <= 6 else (1, 2, 4, 8)
